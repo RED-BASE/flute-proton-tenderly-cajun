@@ -274,8 +274,8 @@ def token_gradients_combined(
     torch.Tensor
         The combined gradients for token optimization.
     """
-
-    embed_weights: torch.Tensor = model.deberta.embeddings.word_embeddings.weight
+    base_model = model.module if isinstance(model, nn.DataParallel) else model
+    embed_weights: torch.Tensor = base_model.deberta.embeddings.word_embeddings.weight
     one_hot: torch.Tensor = torch.zeros(
         input_ids[input_slice].shape[0],
         embed_weights.shape[0],
@@ -291,7 +291,7 @@ def token_gradients_combined(
     input_embeds: torch.Tensor = (one_hot @ embed_weights).unsqueeze(0)
 
     # now stitch it together with the rest of the embeddings
-    embeds: torch.Tensor = model.deberta.embeddings.word_embeddings(input_ids)
+    embeds: torch.Tensor = base_model.deberta.embeddings.word_embeddings(input_ids)
     full_embeds: torch.Tensor = torch.cat(
         [
             embeds[: input_slice.start, :],

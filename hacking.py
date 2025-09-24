@@ -5,6 +5,7 @@ import random
 import string
 import tiktoken
 import argparse
+from difflib import SequenceMatcher
 from typing import List, Dict, Tuple, Any, Optional
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from huggingface_hub import login
@@ -22,6 +23,12 @@ from utils import (
 )
 from difflib import SequenceMatcher
 
+FORBIDDEN_WORDS = ["is", "im", "letter", "time", "not", "general", "shout", "speaks", "the", "soft"] 
+
+# Controls for the "Dynamic Escape Hatch" when the optimizer gets stuck
+PENALTY_GRACE_PERIOD_TRIGGER = 5  # After this many consecutive penalized loops, grant a grace period
+consecutive_penalty_loops = 0     # Counter for consecutive loops where all candidates are penalized
+
 # check if cuda is available
 cuda_available: bool = torch.cuda.is_available()
 device: torch.device = torch.device("cuda" if cuda_available else "cpu")
@@ -29,7 +36,7 @@ device: torch.device = torch.device("cuda" if cuda_available else "cpu")
 if cuda_available:
     # Example: Limit memory on GPU 0 to 80% of its total capacity
     try:
-        torch.cuda.set_per_process_memory_fraction(0.8, device=0)
+        torch.cuda.set_per_process_memory_fraction(0.94, device=0)
         print(f"Successfully set memory fraction for GPU 0.")
     except RuntimeError as e:
         print(f"Could not set memory fraction: {e}")
@@ -65,7 +72,7 @@ top_weight: float = 0.7  # Weight for top average (0.7)
 
 # Define token penalty weight - higher values penalize longer prefixes more
 token_penalty_weight: float = 0.4
-min_acceptable_benign: float = 0.50
+min_acceptable_benign: float = 0.55
 
 model_id: str = "meta-llama/Llama-Prompt-Guard-2-86M"
 # model_id = "meta-llama/Llama-Prompt-Guard-2-22M"
@@ -73,7 +80,13 @@ tokenizer: AutoTokenizer = AutoTokenizer.from_pretrained(model_id)
 model: AutoModelForSequenceClassification = AutoModelForSequenceClassification.from_pretrained(
     model_id
 )
-model = model.to(device)  # Move model to MPS device
+
+# Check for multiple GPUs and wrap the model
+if torch.cuda.device_count() > 1:
+    print(f"Using {torch.cuda.device_count()} GPUs!")
+    model = nn.DataParallel(model)
+
+model.to(device) # Move the model (or the DataParallel wrapper) to the primary GPU
 
 benign_class: str = "label_0"
 malicious_class: str = "label_1"
@@ -82,7 +95,9 @@ malicious_class: str = "label_1"
 benign_class_idx: Optional[int] = None
 malicious_class_idx: Optional[int] = None
 
-for idx, label in model.config.id2label.items():
+# Access config through model.module if using DataParallel
+base_model = model.module if isinstance(model, nn.DataParallel) else model
+for idx, label in base_model.config.id2label.items():
     if label.lower() == benign_class:
         benign_class_idx = idx
     elif label.lower() == malicious_class:
@@ -111,6 +126,7 @@ def conditional_lower(text: str, lowercase_enabled: bool) -> str:
 
 
 def main():
+    global consecutive_penalty_loops
     global injection_text, text, init_prefix_words_count
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Prompt hacking tool")
@@ -227,9 +243,9 @@ def main():
             new_adv_prefix_toks: torch.Tensor = sample_control(
                 adv_prefix_tokens,
                 coordinate_grad,
-                batch_size=32,  # Larger batch for more candidates
-                topk=16,  # More options per token
-                temp=1.5,  # Higher temperature for more exploration
+                batch_size=128,  # Larger batch for more candidates
+                topk=64,  # More options per token
+                temp=1.6,  # Higher temperature for more exploration
             )
 
             # Convert new tokens to text
@@ -272,8 +288,39 @@ def main():
                 * (1 - token_penalty_weight + token_penalty_weight * token_penalties[i])
                 for i in range(len(new_adv_prefix))
             ]
-            idx = int(max(range(len(combined_scores)), key=lambda i: combined_scores[i]))
-            adv_prefix = new_adv_prefix[idx]
+
+            # Penalty block with dynamic escape hatch
+
+            # Temporarily store original scores before applying penalties
+            original_scores = list(combined_scores) 
+
+            # Apply penalty for forbidden words
+            for i in range(len(new_adv_prefix)):
+                candidate_text = new_adv_prefix[i]
+                if any(forbidden_word in candidate_text for forbidden_word in FORBIDDEN_WORDS):
+                    combined_scores[i] = -float('inf')
+
+            # Check if all candidates were penalized
+            if all(s == -float('inf') for s in combined_scores):
+                consecutive_penalty_loops += 1
+                print(f"  Warning: All candidates penalized. Stuck for {consecutive_penalty_loops}/{PENALTY_GRACE_PERIOD_TRIGGER} iterations.")
+
+                # If we are stuck, grant a one-time grace period and ignore the filter
+                if consecutive_penalty_loops >= PENALTY_GRACE_PERIOD_TRIGGER:
+                    print("  >>> ESCAPE HATCH ACTIVATED: Ignoring forbidden words for one iteration to get unstuck.")
+                    # Use the original scores without penalties for this single iteration
+                    idx = int(max(range(len(original_scores)), key=lambda i: original_scores[i]))
+                    adv_prefix = new_adv_prefix[idx]
+                    consecutive_penalty_loops = 0 # Reset the counter
+                else:
+                    # If not stuck long enough, keep the old prefix
+                    pass # adv_prefix remains unchanged
+            else:
+                # If we found at least one valid candidate, proceed normally and reset the counter
+                consecutive_penalty_loops = 0
+                idx = int(max(range(len(combined_scores)), key=lambda i: combined_scores[i]))
+                adv_prefix = new_adv_prefix[idx]
+
 
             # Update the tokens for the next iteration
             adv_prefix_tokens = tokenizer(
@@ -324,10 +371,10 @@ def main():
                     min_token_count = current_token_count
 
                 print(
-                    f"Iteration {i+1}: Class={model.config.id2label[predicted_class_id]} "
+                    f"Iteration {i+1}: Class={base_model.config.id2label[predicted_class_id]} "
                     + f"(benign: {benign_percentage:.2f}%, loss_norm: {normalized_loss:.4f}, "
                     + f"tokens: {current_token_count}, prefix: {adv_prefix})"
-                )
+                    )
 
                 if current_score > best_iteration_score:
                     improvement = current_score - best_iteration_score
@@ -434,27 +481,37 @@ def main():
 
                 # Always track the best prefix we've seen, even if not high confidence
                 if (
-                    model.config.id2label[predicted_class_id].lower() == benign_class
+                    base_model.config.id2label[predicted_class_id].lower() == benign_class
                     and current_score > best_score
                 ):
-                    best_score = current_score
-                    best_prefix = adv_prefix
-                    print(
-                        f"New best benign prefix found with score: {best_score:.4f}, benign confidence: {benign_percentage:.2f}%"
-                    )
+                    if not any(word in adv_prefix for word in FORBIDDEN_WORDS):
+                        best_score = current_score
+                        best_prefix = adv_prefix
+                        print(
+                            f"New best benign prefix found with score: {best_score:.4f}, benign confidence: {benign_percentage:.2f}%"
+                        )
+                    else:
+                        print(
+                            f"  > Found a high-scoring dirty prefix (score: {current_score:.4f}), but it is being ignored."
+                        )
 
                 # Check if we've found a high confidence benign classification (>95%)
                 if (
-                    model.config.id2label[predicted_class_id].lower() == benign_class
+                    base_model.config.id2label[predicted_class_id].lower() == benign_class
                     and benign_score > min_benign_confidence
                 ):
-                    found_high_confidence_benign = True  # Set the flag
-                    best_score = current_score
-                    best_prefix = adv_prefix
-                    print(
-                        f"Found high confidence benign classification ({benign_percentage:.2f}%) at iteration {i+1}! Stopping optimization."
-                    )
-                    break  # Stop optimizing
+                    if not any(word in adv_prefix for word in FORBIDDEN_WORDS):
+                        found_high_confidence_benign = True  # Set the flag
+                        best_score = current_score
+                        best_prefix = adv_prefix
+                        print(
+                            f"Found high confidence benign classification ({benign_percentage:.2f}%) at iteration {i+1}! Stopping optimization."
+                        )
+                        break  # Stop optimizing
+                    else:
+                        print(
+                            f"  > Found a high-confidence dirty prefix (benign: {benign_percentage:.2f}%), but it is not a valid solution. Continuing..."
+                            )
 
         except Exception as e:
             # print stack trace
@@ -513,7 +570,7 @@ def main():
     benign_prob: float = probs[0][benign_class_idx].item() * 100
     print(f"\nPayload is: {text}")
     print(
-        f"Payload without prefix is classified as: {model.config.id2label[predicted_class_id]} (benign probability: {benign_prob:.2f}%)"
+        f"Payload without prefix is classified as: {base_model.config.id2label[predicted_class_id]} (benign probability: {benign_prob:.2f}%)"
     )
 
     # With adversarial prefix
@@ -527,7 +584,7 @@ def main():
     print(f"Prefix is: {adv_prefix}")
     print(f"Complete text using template is: {full_text}")
     print(
-        f"Payload with prefix is classified as: {model.config.id2label[predicted_class_id]} (benign probability: {benign_prob:.2f}%)"
+        f"Payload with prefix is classified as: {base_model.config.id2label[predicted_class_id]} (benign probability: {benign_prob:.2f}%)"
     )
 
     # Try to run inference with the model's classifier
