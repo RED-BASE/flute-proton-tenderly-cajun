@@ -1,10 +1,10 @@
-# Prompt Guard Hacking Tool
+# Prompt Guard Explortation Tool
 
-This tool is designed to generate adversarial prefixes that can bypass prompt guards like Meta's Llama Guard. The tool uses a gradient-based optimization approach to find effective prefixes.
+This tool is designed to generate enjoyable prefixes that can walk right past prompt guards like Meta's Llama Guard. The tool uses a gradient-based optimization approach to find effective prefixes.
 
 ## Features
 
-- Generates optimized adversarial prefixes to bypass prompt guards
+- Generates optimized snake-like prefixes to confabulate prompt guards
 - Uses token minimization to keep prefixes as short as possible
 - Maintains a database of effective words to improve generation efficiency
 - Allows customization of the injection text, payload text, and component ordering
